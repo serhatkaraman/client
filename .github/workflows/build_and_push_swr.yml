@@ -1,0 +1,125 @@
+name: "Client - Build & Push to SWR"
+run-name: "Client Build - ${{ github.ref_name }} (${{ github.sha }})"
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "client/**"
+      - "Dockerfiles/ClientDockerfile"
+      - "Dockerfiles/nginx.conf.template"
+    tags:
+      - '*'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - stg
+          - prod
+
+env:
+  HUAWEI_AK: ${{ secrets.HWC_ACCESS_KEY }}
+  HUAWEI_SK: ${{ secrets.HWC_SECRET_KEY }}
+  HUAWEI_PROJECT: ${{ vars.HUAWEI_PROJECT }}
+  REGISTRY: ${{ vars.SWR_REGISTRY }}
+  NAMESPACE: ${{ vars.SWR_NAMESPACE }}
+  IMAGE_NAME: client
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Resolve target environment
+        id: env
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            TARGET_ENV="${{ inputs.environment }}"
+          elif [[ "${GITHUB_EVENT_NAME}" == "release" ]]; then
+            TARGET_ENV="prod"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TARGET_ENV="stg"
+          elif [[ "${GITHUB_REF}" == "refs/heads/master" ]]; then
+            TARGET_ENV="dev"
+          else
+            echo "Unsupported ref: ${GITHUB_REF}" >&2
+            exit 1
+          fi
+          echo "target=${TARGET_ENV}" >> $GITHUB_OUTPUT
+
+      - name: Set image tag
+        id: vars
+        run: |
+          SHORT_SHA="${GITHUB_SHA:0:6}"
+          REF_NAME=$(echo "${GITHUB_REF_NAME}" | sed 's/\//-/g')
+          echo "tag=${REF_NAME}-${SHORT_SHA}" >> $GITHUB_OUTPUT
+
+      - name: Compute SWR login key
+        id: swrkey
+        run: |
+          LOGIN_KEY=$(echo -n "${HUAWEI_AK}" | openssl dgst -binary -sha256 -hmac "${HUAWEI_SK}" | od -An -vtx1 | tr -d ' \n')
+          echo "key=${LOGIN_KEY}" >> $GITHUB_OUTPUT
+
+      - name: Login to Huawei SWR
+        run: |
+          echo "${LOGIN_KEY}" | docker login "${REGISTRY}" \
+            -u "${HUAWEI_PROJECT}@${HUAWEI_AK}" --password-stdin
+        env:
+          LOGIN_KEY: ${{ steps.swrkey.outputs.key }}
+
+      - name: Build & Push Client
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfiles/ClientDockerfile
+          platforms: linux/amd64
+          push: true
+          pull: true
+          no-cache: true
+          tags: ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.tag }}
+          provenance: false
+          sbom: false
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.tag }},push=true,oci-mediatypes=false
+
+      - name: Update Helm values in baykar-charts
+        env:
+          HELM_REPO_PAT: ${{ secrets.HELM_REPO_PAT }}
+          IMAGE_TAG: ${{ steps.vars.outputs.tag }}
+          TARGET_ENV: ${{ steps.env.outputs.target }}
+        run: |
+          set -euo pipefail
+
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+          git clone --depth 1 --branch master \
+            "https://x-access-token:${HELM_REPO_PAT}@github.com/serhatkaraman/baykar-charts.git" charts-repo
+          cd charts-repo
+
+          VALUES_FILE="client/values/${TARGET_ENV}/values.yaml"
+          yq -i ".image.tag = \"${IMAGE_TAG}\"" "${VALUES_FILE}"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet -- "${VALUES_FILE}"; then
+            echo "No changes; skipping commit."
+            exit 0
+          fi
+
+          git add "${VALUES_FILE}"
+          git commit -m "chore(client): bump ${TARGET_ENV} image to ${IMAGE_TAG}"
+          git push origin master
