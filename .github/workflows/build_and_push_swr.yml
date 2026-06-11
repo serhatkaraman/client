@@ -5,9 +5,11 @@ on:
   push:
     branches: [master]
     paths:
-      - "client/**"
-      - "Dockerfiles/ClientDockerfile"
-      - "Dockerfiles/nginx.conf.template"
+      - "src/**"
+      - "public/**"
+      - "package*.json"
+      - "Dockerfile"
+      - "nginx.conf.template"
     tags:
       - '*'
   release:
@@ -84,7 +86,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfiles/ClientDockerfile
+          file: Dockerfile
           platforms: linux/amd64
           push: true
           pull: true
